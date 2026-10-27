@@ -120,6 +120,7 @@ None of these block milestone 1; each can be settled when its milestone arrives.
 - [ ] Idle threshold for auto-pause, and what counts as activity
 - [ ] Multi-container sandboxes before microVMs: nested Podman in v1, or wait for Firecracker
 - [ ] Host choice beyond "has the template, least loaded"
+- [ ] Capacity: how a host tracks disk it has promised versus disk actually used (clones start empty and grow), what happens when a create, fork, template build or move doesn't fit, and what to free up as the pool fills. Includes whether to cap the whole `tank/sbx` tree with a `quota`, and whether to promise more space than exists
 - [ ] A name for the project
 
 **Out of scope:** agent orchestration, session or pane UI, git and PR workflow, and which credentials an agent uses (all belong to the client on top). Also mixed machines without ZFS, other people's compute or multiple tenants, GPUs, Kubernetes, and a highly available or replicated coordinator.
