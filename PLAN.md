@@ -29,14 +29,14 @@ With one host there is no control plane: clients talk to `sbxd` directly, and `z
 - **ZFS layout.** Templates live at `tank/sbx/templates/<name>` with a snapshot per version (`@v1`). Sandboxes live at `tank/sbx/sandboxes/<id>`, each a clone of a template snapshot.
 - **Templates are root filesystems.** A container image is exported and unpacked into the template dataset, then the repo is cloned and its dependencies installed, then it is snapshotted. A sandbox is the whole machine's disk, not just a workspace folder.
 - **Template recipe.** Each template is built from a recipe (Dockerfile plus a small manifest) that also declares what a sandbox of it gets: CPU and memory limits, disk quota, ports to expose, and which secrets to inject at create time. The recipe is what makes a template reproducible.
-- **Runtime.** Version 1 runs each clone as a container root filesystem (Podman's `--rootfs`, or `runc` directly). Version 2 adds Firecracker microVMs on hosts with KVM, using ZFS volumes (zvols) as their disks.
+- **Runtime.** Version 1 runs each clone as a container root filesystem with `runc` (or `crun`, which takes the same OCI spec and commands; the runtime binary is a config setting). `sbxd` generates each sandbox's OCI `config.json` (rootfs is the clone's mountpoint, cgroup limits from the recipe, a tiny init as PID 1) and creates and owns the sandbox's network namespace, veth pair and nftables rules. There is no Podman: no second container database, and no other tool writing firewall rules, so ZFS stays the only durable record and runc's state lives in `/run`. Exec is `runc exec`, with `sbxd` holding the pipes. All of this sits behind a small Go `Runtime` interface (start, freeze, thaw, exec, stop, list) so version 2 can add Firecracker microVMs on hosts with KVM, using ZFS volumes (zvols) as their disks.
 - **Metadata.** ZFS user properties on each dataset, such as `sbx:template`, `sbx:template-guid`, `sbx:parent`, `sbx:created` and `sbx:ttl`.
 
 ## Sandbox boundaries
 
 What a sandbox can reach and what it holds. These are defaults; a template can loosen them explicitly.
 
-- **Network: isolated by default.** Egress to the internet only. No traffic to other sandboxes, the host, or anything on the tailnet (drop `100.64.0.0/10`, the host's addresses and private ranges in the sandbox's network namespace). Every host is a tailnet node, so without this rule a sandbox could reach the coordinator or other hosts. Management never needs a sandbox on the tailnet: clients go through `sbxd`, which reaches its sandboxes locally.
+- **Network: isolated by default.** Egress to the internet only. No traffic to other sandboxes, the host, or anything on the tailnet (drop `100.64.0.0/10`, the host's addresses and private ranges). The rules live on the host side, in the forward chain matched on the host end of each sandbox's veth, not inside the sandbox's network namespace, where anything with `CAP_NET_ADMIN` in the sandbox could delete them. Every host is a tailnet node, so without this rule a sandbox could reach the coordinator or other hosts. Management never needs a sandbox on the tailnet: clients go through `sbxd`, which reaches its sandboxes locally.
 - **Secrets: injected, never baked.** Secrets named in the template recipe are injected at create time. Which secrets those are, and how narrowly they're scoped, is the client's concern.
 - **Ports.** Ports declared in the template are reachable from your tailnet through `sbxd` (forwarded over `tsnet`), so a sandbox can run a dev server or a preview environment. Pairs naturally with branchable SQL Server databases for per-PR previews.
 - **Resources.** `refquota` caps disk; cgroup limits from the template recipe cap CPU and memory. Idle sandboxes auto-pause (no exec or port traffic for a set period) and resume on the next request, in addition to TTL expiry.
@@ -56,15 +56,15 @@ Every operation is a thin wrapper over a few ZFS commands plus a container start
 | Move to another host | Ship only the blocks changed since the template | `zfs send -i @v1 .../<id>@pause`, piped to `zfs receive` on the other host | Proportional to the sandbox's changes, not its size |
 | Destroy | Stop the container, destroy the dataset; clean up unused templates | `zfs destroy` | Instant |
 
-Freezing before a fork (Podman's `pause`, which uses the kernel's cgroup freezer) stops every process at the same instant, so the snapshot is consistent across processes. Without it, the snapshot is crash-consistent, which the SQL Server demo showed is still recoverable.
+Freezing before a fork (`runc pause`, which writes to the sandbox's cgroup freezer) stops every process at the same instant, so the snapshot is consistent across processes. Without it, the snapshot is crash-consistent, which the SQL Server demo showed is still recoverable.
 
 ## Milestones
 
 Each milestone ends in something you can run and measure, and stopping after milestone 4 already gives you a working, demoable system.
 
 0. **Done: ZFS branching demo.** ZFS pool on the Arch machine, SQL Server branched and verified independent.
-1. **Manual fork demo.** Build a template dataset by hand from one of your real repos with its dependencies installed. Snapshot it, clone it five times, and run the test suite in each clone with `podman run --rootfs`.
-   - Done when: five sandboxes run tests in parallel and `zfs list` shows what each one cost.
+1. **Manual fork demo.** Build a template dataset by hand from one of your real repos with its dependencies installed. Snapshot it, clone it five times, and run the test suite in each clone with `runc run`, using a hand-written OCI spec and a network namespace set up by hand. Time container start with both `runc` and `crun` on the same clone.
+   - Done when: five sandboxes run tests in parallel, `zfs list` shows what each one cost, and you have start-time numbers for `runc` and `crun`.
 2. **sbxd v0 on one host.** A Go daemon, its API and the CLI with create, list, exec, files and destroy. Templates built from a recipe, metadata in ZFS properties (including the template snapshot's `guid`), ULID sandbox IDs, served on localhost only. Default network isolation and CPU, memory and disk limits from the recipe. Shape the API as the single endpoint the coordinator will later expose too.
    - Done when: `sbx create app` then `sbx exec <id> npm test` works end to end, and the sandbox can reach the internet but not the tailnet.
 3. **Fork, pause, resume and cleanup.** Freeze-and-fork, pause and resume, idle auto-pause, and a reaper that destroys sandboxes past their `sbx:ttl` and unused template versions. The reaper is a plain loop on each host; it later becomes the orphan reconciler.
@@ -101,7 +101,7 @@ The biggest one: build each template once and distribute it with `zfs send`, nev
 - **Cap every sandbox.** Set `refquota` on each sandbox so a runaway process can't fill the whole pool.
 - **Snapshots hold deleted data.** Space freed inside a sandbox isn't returned while a snapshot still references it, so stale fork and pause snapshots need cleaning up too.
 - **Never bake secrets into a template.** Every clone and every send carries them. Inject them at create time instead.
-- **Hosts are tailnet nodes.** A sandbox with default networking can reach whatever its host can. Block the tailnet and private ranges from the sandbox network namespace before anything else.
+- **Hosts are tailnet nodes.** A sandbox with default networking can reach whatever its host can. Block the tailnet and private ranges for every sandbox, on the host side, before anything else.
 - **Forks copy everything on disk, including identities.** Anything with per-machine identity inside a sandbox (a Tailscale node key, SSH host keys) is duplicated by every fork. If sandboxes ever join the tailnet, that state must live outside the snapshot and be regenerated per fork.
 - **sbxd needs root.** ZFS and container setup need privileges, so keep the daemon's API small and reachable only over the tailnet.
 - **Pick a steady OS for hosts.** On Arch, a kernel update can briefly break ZFS. Ubuntu ships ZFS with its kernel, which makes it a calmer choice for the second host.
@@ -110,11 +110,11 @@ The biggest one: build each template once and distribute it with `zfs send`, nev
 
 None of these block milestone 1; each can be settled when its milestone arrives.
 
-- [ ] Container runtime: Podman with `--rootfs`, `runc` directly, or `systemd-nspawn`
+- [x] ~~Container runtime: Podman with `--rootfs`, `runc` directly, or `systemd-nspawn`~~ `runc`/`crun` driven directly by `sbxd`, which owns network setup. Podman would add a second source of truth and its own firewall rules; nspawn's exec story is clumsier and it isn't OCI. Revisit nspawn only if multi-container sandboxes are needed before microVMs
 - [ ] API shape: HTTP and JSON or gRPC, and how exec output streams back
 - [ ] Template manifest format: devcontainer.json subset or a small sbx-specific file
 - [ ] Getting code in: repo baked into the template plus a `git fetch` of a requested ref at create, or pushed in per sandbox
-- [ ] How egress isolation is enforced: nftables in each sandbox's network namespace, or a per-host egress proxy
+- [ ] How egress isolation is enforced: host-side nftables in the forward chain, or a per-host egress proxy
 - [ ] How ports are exposed: one forwarded port per sandbox on `sbxd`, or a `tsnet` hostname per sandbox
 - [ ] Sandbox mesh: an opt-in template setting that gives each sandbox an ephemeral, tagged tailnet identity, with ACLs allowing only sandbox-to-sandbox traffic. Only when a real use case needs it, and after forking works
 - [ ] Idle threshold for auto-pause, and what counts as activity
