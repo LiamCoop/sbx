@@ -27,16 +27,23 @@ With one host there is no control plane: clients talk to `sbxd` directly, and `z
 - **Who is authoritative.** Hosts are authoritative for facts: which datasets and snapshots exist, and whether each container is running. The coordinator is authoritative only for intent and for what no single host can know. It rebuilds its sandbox index from hosts, so it never contradicts ZFS. If it is down, the global view is lost but each host still serves direct requests.
 - **Identity.** A template version is identified by its snapshot's `guid`, recorded as a property from milestone 2. That is how you check that two hosts share the exact same snapshot. Sandbox IDs are globally unique (ULIDs) so per-host indexes merge without collisions.
 - **ZFS layout.** Templates live at `tank/sbx/templates/<name>` with a snapshot per version (`@v1`). Sandboxes live at `tank/sbx/sandboxes/<id>`, each a clone of a template snapshot.
-- **Templates are root filesystems.** A container image is exported and unpacked into the template dataset, then the repo is cloned and its dependencies installed, then it is snapshotted. A sandbox is the whole machine's disk, not just a workspace folder.
-- **Template recipe.** Each template is built from a recipe (Dockerfile plus a small manifest) that also declares what a sandbox of it gets: CPU and memory limits, disk quota, ports to expose, and which secrets to inject at create time. The recipe is what makes a template reproducible.
+- **Templates are root filesystems.** `sbxd` pulls a base image by digest and flattens it into the template dataset itself (in Go, with `go-containerregistry`, the library behind `crane export`), snapshots that as `@base`, then runs the recipe's setup steps (clone the repo, install dependencies) in a temporary build sandbox on the dataset, and snapshots the result. Build steps get the same runtime and network isolation as any sandbox, so the step that runs `npm install` and its postinstall scripts is never the least isolated thing on the host. There is no buildah or BuildKit: no second image store, and no other tool writing firewall rules. A rebuild clones from `@base` rather than pulling again. A sandbox is the whole machine's disk, not just a workspace folder.
+- **Template recipe.** Each template is built from a recipe: a small sbx-specific manifest naming a base image pinned by digest and a list of setup steps. A Dockerfile is optional and lives outside `sbxd`: build and push it with anything, then reference the result by digest. The manifest also declares what a sandbox of it gets: CPU and memory limits, disk quota, ports to expose, and which secrets to inject at create time. The recipe, with the image digest recorded as `sbx:image-digest`, is what makes a template reproducible.
 - **Runtime.** Version 1 runs each clone as a container root filesystem with `runc` (or `crun`, which takes the same OCI spec and commands; the runtime binary is a config setting). `sbxd` generates each sandbox's OCI `config.json` (rootfs is the clone's mountpoint, cgroup limits from the recipe, a tiny init as PID 1) and creates and owns the sandbox's network namespace, veth pair and nftables rules. There is no Podman: no second container database, and no other tool writing firewall rules, so ZFS stays the only durable record and runc's state lives in `/run`. Exec is `runc exec`, with `sbxd` holding the pipes. All of this sits behind a small Go `Runtime` interface (start, freeze, thaw, exec, stop, list) so version 2 can add Firecracker microVMs on hosts with KVM, using ZFS volumes (zvols) as their disks.
-- **Metadata.** ZFS user properties on each dataset, such as `sbx:template`, `sbx:template-guid`, `sbx:parent`, `sbx:created` and `sbx:ttl`.
+- **Metadata.** ZFS user properties on each dataset, such as `sbx:template`, `sbx:template-guid`, `sbx:image-digest`, `sbx:parent`, `sbx:created`, `sbx:ttl` and `sbx:state` (`creating`, `running` or `paused`: the intended state, which `sbxd` restores after a restart).
 
 ## Sandbox boundaries
 
 What a sandbox can reach and what it holds. These are defaults; a template can loosen them explicitly.
 
-- **Network: isolated by default.** Egress to the internet only. No traffic to other sandboxes, the host, or anything on the tailnet (drop `100.64.0.0/10`, the host's addresses and private ranges). The rules live on the host side, in the forward chain matched on the host end of each sandbox's veth, not inside the sandbox's network namespace, where anything with `CAP_NET_ADMIN` in the sandbox could delete them. Every host is a tailnet node, so without this rule a sandbox could reach the coordinator or other hosts. Management never needs a sandbox on the tailnet: clients go through `sbxd`, which reaches its sandboxes locally.
+- **Network: isolated by default.** Egress to the internet only. No traffic to other sandboxes, the host, or anything on the tailnet. Every host is a tailnet node, so without this a sandbox could reach the coordinator or other hosts. Management never needs a sandbox on the tailnet: clients go through `sbxd`, which reaches its sandboxes locally.
+  - **Rules live on the host.** One nftables table owned by `sbxd`, matched on the host end of each sandbox's veth, never inside the sandbox's network namespace, where anything with `CAP_NET_ADMIN` could delete them. Host-side veths are named `sbx-<id>` so one wildcard rule covers every sandbox.
+  - **Routed veths, not a bridge.** Each sandbox gets its own point-to-point link (a `/31` from a host pool) and a host route, so every packet it sends, including to another sandbox, is routed through the forward chain and matched on an interface the sandbox can't change. A shared bridge would switch sandbox-to-sandbox traffic at layer 2, past the forward chain, and need `br_netfilter` or a second rule set to stop it. Firecracker's tap devices in version 2 are routed the same way.
+  - **Forward chain: an allowlist.** Traffic from a sandbox veth is accepted only if it is IPv4 to a non-private destination (not `100.64.0.0/10`, RFC 1918, link-local, loopback or multicast); everything else is dropped, so anything not thought of is denied by default.
+  - **Input chain: closed.** A packet addressed to any of the host's own addresses (its LAN or tailnet IP, a veth gateway) goes to the input chain, not forward. The table drops every new connection arriving on a sandbox veth and allows only replies to connections the host opened.
+  - **IPv4 only.** IPv6 from a sandbox is dropped by the allowlist; otherwise the tailnet's IPv6 range (`fd7a:115c:a1e0::/48`) would be reachable whenever IPv6 forwarding is on. `disable_ipv6` inside the namespace only stops programs stalling on IPv6; it isn't the boundary.
+  - **DNS.** A public resolver is written into each sandbox's `/etc/resolv.conf` at create. Never the host's resolver or Tailscale's MagicDNS, so the host stays closed.
+  - **Order of setup.** `sbxd` installs the table before it enables IPv4 forwarding, and refuses to start sandboxes if the table is missing.
 - **Secrets: injected, never baked.** Secrets named in the template recipe are injected at create time. Which secrets those are, and how narrowly they're scoped, is the client's concern.
 - **Ports.** Ports declared in the template are reachable from your tailnet through `sbxd` (forwarded over `tsnet`), so a sandbox can run a dev server or a preview environment. Pairs naturally with branchable SQL Server databases for per-PR previews.
 - **Resources.** `refquota` caps disk; cgroup limits from the template recipe cap CPU and memory. Idle sandboxes auto-pause (no exec or port traffic for a set period) and resume on the next request, in addition to TTL expiry.
@@ -47,7 +54,7 @@ Every operation is a thin wrapper over a few ZFS commands plus a container start
 
 | Operation | What sbxd does | ZFS underneath | Cost |
 | --- | --- | --- | --- |
-| Build template | Unpack an image's root filesystem, clone the repo, install dependencies, snapshot | `zfs create`, then `zfs snapshot .../templates/app@v1` | Minutes, once per template version |
+| Build template | Pull and flatten a base image, run setup steps (clone the repo, install dependencies) in a build sandbox, snapshot | `zfs create`, then `zfs snapshot .../templates/app@v1` | Minutes, once per template version |
 | Create | Clone the template snapshot, inject secrets, start a container on it | `zfs clone .../app@v1 .../sandboxes/<id>` | Clone is instant; container start dominates |
 | Exec, attach and files | Run commands, stream output, read and write files over the tailnet API | None | One network round trip per call |
 | Fork N ways | Freeze the sandbox, snapshot it, clone it N times, unfreeze | `zfs snapshot .../<id>@fork1`, then `zfs clone` N times | Instant; each fork pays only for its own writes |
@@ -57,6 +64,12 @@ Every operation is a thin wrapper over a few ZFS commands plus a container start
 | Destroy | Stop the container, destroy the dataset; clean up unused templates | `zfs destroy` | Instant |
 
 Freezing before a fork (`runc pause`, which writes to the sandbox's cgroup freezer) stops every process at the same instant, so the snapshot is consistent across processes. Without it, the snapshot is crash-consistent, which the SQL Server demo showed is still recoverable.
+
+### Restarts and reboots
+
+- **`sbxd` restarts, host stays up.** Sandboxes keep running: they are started detached (`runc create` then `runc start`, init's stdio to a log file), and each network namespace is pinned at `/run/sbx/netns/<id>`, so the veths, routes and nftables table live in the kernel, not in `sbxd`. On startup `sbxd` adopts what exists, from `zfs list`, `runc list` and the live veths. Execs in flight are lost, because `sbxd` held their pipes: the client sees "connection lost, exit status unknown", never success.
+- **Host reboots.** `/run` is wiped, so runc state, namespaces, veths, the nftables table and every process are gone, while the datasets survive. That is the same as a pause. On boot `sbxd` reinstalls the table, enables forwarding, and starts a fresh container on every dataset whose `sbx:state` is `running`, the same code path as resume. Sandboxes may get new IPs; nothing outside `sbxd` records them.
+- **Crash mid-operation.** `sbxd` sets `sbx:state=creating` before anything else and `running` at the end. On startup it removes any runc container, veth, namespace or bundle directory without a matching dataset, and destroys datasets still marked `creating`. This is the first cut of the orphan reconciler that milestone 3's reaper grows into.
 
 ## Milestones
 
@@ -112,11 +125,12 @@ None of these block milestone 1; each can be settled when its milestone arrives.
 
 - [x] ~~Container runtime: Podman with `--rootfs`, `runc` directly, or `systemd-nspawn`~~ `runc`/`crun` driven directly by `sbxd`, which owns network setup. Podman would add a second source of truth and its own firewall rules; nspawn's exec story is clumsier and it isn't OCI. Revisit nspawn only if multi-container sandboxes are needed before microVMs
 - [ ] API shape: HTTP and JSON or gRPC, and how exec output streams back
-- [ ] Template manifest format: devcontainer.json subset or a small sbx-specific file
+- [x] ~~Template manifest format: devcontainer.json subset or a small sbx-specific file~~ A small sbx-specific file: base image by digest, setup steps, limits, ports, secrets. devcontainer.json is built around Dockerfiles and features, which `sbxd` doesn't run
 - [ ] Getting code in: repo baked into the template plus a `git fetch` of a requested ref at create, or pushed in per sandbox
-- [ ] How egress isolation is enforced: host-side nftables in the forward chain, or a per-host egress proxy
+- [x] ~~How egress isolation is enforced: host-side nftables in the forward chain, or a per-host egress proxy~~ Host-side nftables on routed veths: an allowlist in the forward chain and a closed input chain (see Sandbox boundaries). A per-host egress proxy or DNS forwarder can be added later for logging or filtering
 - [ ] How ports are exposed: one forwarded port per sandbox on `sbxd`, or a `tsnet` hostname per sandbox
 - [ ] Sandbox mesh: an opt-in template setting that gives each sandbox an ephemeral, tagged tailnet identity, with ACLs allowing only sandbox-to-sandbox traffic. Only when a real use case needs it, and after forking works
+- [ ] Reattachable exec: a small shim per exec that holds the process and buffers its output, so an exec survives an `sbxd` restart. Deferred until something needs it
 - [ ] Idle threshold for auto-pause, and what counts as activity
 - [ ] Multi-container sandboxes before microVMs: nested Podman in v1, or wait for Firecracker
 - [ ] Host choice beyond "has the template, least loaded"
